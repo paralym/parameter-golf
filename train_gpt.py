@@ -789,12 +789,13 @@ class GPT(nn.Module):
             z_pred = self.jepa_predictor(src_h)                    # [B, N-1, H, d]
             z_tgt  = self.jepa_predictor(tgt_h).detach()           # [B, N-1, H, d]
 
-            # Cosine matching loss per slot
+            # Cosine matching loss per slot — focal: weight by block error
             sd = z_pred.shape[-1]
             z_pred_n = F.rms_norm(z_pred, (sd,))
             z_tgt_n  = F.rms_norm(z_tgt,  (sd,))
             cos_sim  = (z_pred_n * z_tgt_n).sum(-1)               # [B, N-1, H]
-            jepa_loss = (1.0 - cos_sim).mean()
+            block_error = (1.0 - cos_sim).mean(-1, keepdim=True).detach()  # [B, N-1, 1]
+            jepa_loss = (block_error * (1.0 - cos_sim)).mean()    # error-weighted
 
             # Slot decorrelation: penalise pairwise cosine between slots
             if self.jepa_decorr_lambda > 0.0:
