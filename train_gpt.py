@@ -644,6 +644,9 @@ class Block(nn.Module):
         self.depth_gate = nn.Linear(dim, 1, bias=True)
         nn.init.zeros_(self.depth_gate.weight)
         nn.init.constant_(self.depth_gate.bias, 2.0)
+        # Context gate: x0 (global embedding) conditions routing
+        self.ctx_gate = nn.Linear(dim, 1, bias=False)
+        nn.init.zeros_(self.ctx_gate.weight)
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         x_in = x  # save input for soft skip
@@ -652,8 +655,8 @@ class Block(nn.Module):
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        # Soft depth gate: per-token blend of block output vs skip
-        gate = torch.sigmoid(self.depth_gate(x_in))  # [B, T, 1]
+        # Soft depth gate: x_in + global context x0
+        gate = torch.sigmoid(self.depth_gate(x_in) + self.ctx_gate(x0))  # [B, T, 1]
         return gate * x + (1 - gate) * x_in
 
 
