@@ -69,6 +69,9 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    jepa_lambda   = float(os.environ.get("JEPA_LAMBDA", 0.1))
+    jepa_pred_dim = int(os.environ.get("JEPA_PRED_DIM", 256))
+    jepa_block_size = int(os.environ.get("JEPA_BLOCK_SIZE", 8))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -645,6 +648,18 @@ class Block(nn.Module):
         return x
 
 
+
+class JEPAPredictor(nn.Module):
+    """Predict next block latent from current block boundary hidden state."""
+    def __init__(self, dim: int, pred_dim: int):
+        super().__init__()
+        self.fc1 = CastedLinear(dim, pred_dim, bias=False)
+        self.fc2 = CastedLinear(pred_dim, dim, bias=False)
+        nn.init.zeros_(self.fc2.weight)
+
+    def forward(self, h: Tensor) -> Tensor:
+        return self.fc2(F.gelu(self.fc1(h)))
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -688,6 +703,9 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.jepa_predictor = JEPAPredictor(model_dim, model_dim // 2)
+        self.jepa_lambda = 0.0  # set after construction from args
+        self.jepa_block_size = 8
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -712,16 +730,36 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        final_hidden = self.final_norm(x)  # [B, T, dim]
+        x_flat = final_hidden.reshape(-1, final_hidden.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x_flat, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        if self.training and self.jepa_lambda > 0.0:
+            B_sz, T_len, D = final_hidden.shape
+            bs = self.jepa_block_size
+            num_blocks = T_len // bs
+            # Block boundary states: [B, num_blocks, D]
+            boundary_h = final_hidden[:, ::bs, :]
+            # Predict next-block latent for blocks 0..num_blocks-2
+            z_hat = self.jepa_predictor(boundary_h[:, :-1, :])
+            # Target: mean of hidden states in next block, stop gradient
+            block_means = final_hidden.reshape(B_sz, num_blocks, bs, D).mean(dim=2)
+            z_star = block_means[:, 1:, :].detach()
+            jepa_loss = F.mse_loss(
+                F.rms_norm(z_hat, (D,)),
+                F.rms_norm(z_star, (D,)),
+            )
+            return ce_loss + self.jepa_lambda * jepa_loss
+
+        return ce_loss
 
 
 # -----------------------------
@@ -839,6 +877,8 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
+    base_model.jepa_lambda = args.jepa_lambda
+    base_model.jepa_block_size = args.jepa_block_size
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
@@ -861,6 +901,9 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # JEPA predictor: small MLP, use scalar_lr via Adam
+    for p in base_model.jepa_predictor.parameters():
+        scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
