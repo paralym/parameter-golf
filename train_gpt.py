@@ -69,9 +69,11 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    jepa_lambda   = float(os.environ.get("JEPA_LAMBDA", 0.1))
-    jepa_pred_dim = int(os.environ.get("JEPA_PRED_DIM", 256))
-    jepa_block_size = int(os.environ.get("JEPA_BLOCK_SIZE", 8))
+    jepa_lambda        = float(os.environ.get("JEPA_LAMBDA", 0.1))
+    jepa_num_slots     = int(os.environ.get("JEPA_NUM_SLOTS", 4))
+    jepa_slot_dim      = int(os.environ.get("JEPA_SLOT_DIM", 128))
+    jepa_block_size    = int(os.environ.get("JEPA_BLOCK_SIZE", 8))
+    jepa_decorr_lambda = float(os.environ.get("JEPA_DECORR_LAMBDA", 0.01))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -656,16 +658,37 @@ class Block(nn.Module):
 
 
 
-class JEPAPredictor(nn.Module):
-    """Predict next block latent from current block boundary hidden state."""
-    def __init__(self, dim: int, pred_dim: int):
+class MultiSlotJEPAPredictor(nn.Module):
+    """H-slot predictor: each slot attends over K block tokens via cross-attn.
+    Input:  block_h [B, N_blk, K, D]
+    Output: Z       [B, N_blk, H, d]  where d = slot_dim
+    """
+    def __init__(self, dim: int, num_slots: int, slot_dim: int):
         super().__init__()
-        self.fc1 = CastedLinear(dim, pred_dim, bias=False)
-        self.fc2 = CastedLinear(pred_dim, dim, bias=False)
-        nn.init.zeros_(self.fc2.weight)
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.scale = slot_dim ** -0.5
+        # H learned query vectors — init orthogonally for slot diversity
+        self.slot_q = nn.Parameter(torch.zeros(num_slots, slot_dim))
+        nn.init.orthogonal_(self.slot_q)
+        self.k_proj = CastedLinear(dim, slot_dim, bias=False)
+        self.v_proj = CastedLinear(dim, slot_dim, bias=False)
+        self.out_proj = CastedLinear(slot_dim, slot_dim, bias=False)
+        nn.init.zeros_(self.out_proj.weight)
 
-    def forward(self, h: Tensor) -> Tensor:
-        return self.fc2(F.gelu(self.fc1(h)))
+    def forward(self, block_h: Tensor) -> Tensor:
+        # block_h: [B, N_blk, K, D]
+        B, N, K, D = block_h.shape
+        x = block_h.reshape(B * N, K, D)
+        k = self.k_proj(x)                              # [B*N, K, d]
+        v = self.v_proj(x)                              # [B*N, K, d]
+        # q: [H, d] → broadcast attn over B*N positions
+        q = self.slot_q.unsqueeze(0)                    # [1, H, d]
+        attn = torch.matmul(q, k.transpose(1, 2)) * self.scale  # [B*N, H, K]
+        attn = attn.softmax(dim=-1)
+        z = torch.matmul(attn, v)                       # [B*N, H, d]
+        z = self.out_proj(z)
+        return z.reshape(B, N, self.num_slots, self.slot_dim)
 
 class GPT(nn.Module):
     def __init__(
@@ -710,8 +733,9 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        self.jepa_predictor = JEPAPredictor(model_dim, model_dim // 2)
-        self.jepa_lambda = 0.0  # set after construction from args
+        self.jepa_predictor = MultiSlotJEPAPredictor(model_dim, 4, model_dim // 4)
+        self.jepa_lambda = 0.0        # set after construction from args
+        self.jepa_decorr_lambda = 0.0
         self.jepa_block_size = 8
         self._init_weights()
 
@@ -753,17 +777,35 @@ class GPT(nn.Module):
             B_sz, T_len, D = final_hidden.shape
             bs = self.jepa_block_size
             num_blocks = T_len // bs
-            # Block boundary states: [B, num_blocks, D]
-            boundary_h = final_hidden[:, ::bs, :]
-            # Predict next-block latent for blocks 0..num_blocks-2
-            z_hat = self.jepa_predictor(boundary_h[:, :-1, :])
-            # Target: mean of hidden states in next block, stop gradient
-            block_means = final_hidden.reshape(B_sz, num_blocks, bs, D).mean(dim=2)
-            z_star = block_means[:, 1:, :].detach()
-            jepa_loss = F.mse_loss(
-                F.rms_norm(z_hat, (D,)),
-                F.rms_norm(z_star, (D,)),
-            )
+            # Reshape into blocks: [B, N_blk, K, D]
+            block_h = final_hidden.reshape(B_sz, num_blocks, bs, D)
+            src_h = block_h[:, :-1, :, :]          # current blocks 0..N-2
+            tgt_h = block_h[:, 1:, :, :].detach()  # next blocks 1..N-1, stop grad
+
+            # Multi-slot predictions (grads flow) and targets (fully stop_grad)
+            z_pred = self.jepa_predictor(src_h)                    # [B, N-1, H, d]
+            z_tgt  = self.jepa_predictor(tgt_h).detach()           # [B, N-1, H, d]
+
+            # Cosine matching loss per slot
+            sd = z_pred.shape[-1]
+            z_pred_n = F.rms_norm(z_pred, (sd,))
+            z_tgt_n  = F.rms_norm(z_tgt,  (sd,))
+            cos_sim  = (z_pred_n * z_tgt_n).sum(-1)               # [B, N-1, H]
+            jepa_loss = (1.0 - cos_sim).mean()
+
+            # Slot decorrelation: penalise pairwise cosine between slots
+            if self.jepa_decorr_lambda > 0.0:
+                z_n = F.normalize(z_pred_n.reshape(-1, 4, sd), dim=-1)  # [B*N, 4, d]
+                decorr = (
+                    (z_n[:, 0] * z_n[:, 1]).sum(-1).abs() +
+                    (z_n[:, 0] * z_n[:, 2]).sum(-1).abs() +
+                    (z_n[:, 0] * z_n[:, 3]).sum(-1).abs() +
+                    (z_n[:, 1] * z_n[:, 2]).sum(-1).abs() +
+                    (z_n[:, 1] * z_n[:, 3]).sum(-1).abs() +
+                    (z_n[:, 2] * z_n[:, 3]).sum(-1).abs()
+                ).mean() / 6.0
+                return ce_loss + self.jepa_lambda * jepa_loss + self.jepa_decorr_lambda * decorr
+
             return ce_loss + self.jepa_lambda * jepa_loss
 
         return ce_loss
@@ -885,6 +927,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     base_model.jepa_lambda = args.jepa_lambda
+    base_model.jepa_decorr_lambda = args.jepa_decorr_lambda
     base_model.jepa_block_size = args.jepa_block_size
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -908,7 +951,7 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    # JEPA predictor: small MLP, use scalar_lr via Adam
+    # Multi-slot JEPA predictor
     for p in base_model.jepa_predictor.parameters():
         scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
