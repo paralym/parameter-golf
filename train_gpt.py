@@ -61,7 +61,7 @@ class Hyperparameters:
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 10))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -638,14 +638,21 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # MoD: soft per-token depth gate. Init bias=2 → gate≈0.88 (mostly pass-through at start)
+        self.depth_gate = nn.Linear(dim, 1, bias=True)
+        nn.init.zeros_(self.depth_gate.weight)
+        nn.init.constant_(self.depth_gate.bias, 2.0)
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        x_in = x  # save input for soft skip
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        # Soft depth gate: per-token blend of block output vs skip
+        gate = torch.sigmoid(self.depth_gate(x_in))  # [B, T, 1]
+        return gate * x + (1 - gate) * x_in
 
 
 
