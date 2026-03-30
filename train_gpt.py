@@ -782,8 +782,8 @@ class GPT(nn.Module):
             num_blocks = T_len // bs
             # Reshape into blocks: [B, N_blk, K, D]
             block_h = final_hidden.reshape(B_sz, num_blocks, bs, D)
-            src_h = block_h[:, :-1, :, :]          # current blocks 0..N-2
-            tgt_h = block_h[:, 1:, :, :].detach()  # next blocks 1..N-1, stop grad
+            src_h = block_h[:, :-2, :, :]          # blocks 0..N-2-1
+            tgt_h = block_h[:, 2:, :, :].detach()  # blocks 2..N-1, stop grad
 
             # Multi-slot predictions (grads flow) and targets (fully stop_grad)
             z_pred = self.jepa_predictor(src_h)                    # [B, N-1, H, d]
